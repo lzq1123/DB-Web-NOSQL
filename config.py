@@ -1,7 +1,4 @@
 import os
 class Config:
     # Configuration for PostgreSQL database
-    SQLALCHEMY_DATABASE_URI = 'postgresql://ticketgrab:strawberries@ticketgrab.cly1peobyaye.us-east-1.rds.amazonaws.com:5432/ticketgrabdb'
-    QLALCHEMY_TRACK_MODIFICATIONS = False
-    TICKETMASTER_API_KEY = 'eX1Cju21ITBzuzX7qEi0vUlQacKAARt6'
-    APP_SECRET_KEY = 'strawberries'
+    MONGO_URI = "mongodb+srv://admin:w1f8LoPBnB3sRX2I@db-web.mongodb.net/ticketgrabdb?retryWrites=true&w=majority"
