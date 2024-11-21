@@ -95,155 +95,101 @@ with app.app_context():
         logging.error(f"Error during index creation: {e}\n{traceback.format_exc()}")
 
  
+
+
 # Routes
 @app.route('/')
 def home():
     preferred_width = 1920
 
     # Query to fetch events with the most transactions
-    hot_events_info = db.session.query(
-        Event.EventID,
-        Event.EventName,
-        func.count(Transactions.TranscID).label('transaction_count')
-    ).join(Event.ticketCategory) \
-      .join(TicketCategory.ticket) \
-      .join(Ticket.transaction) \
-      .group_by(Event.EventID) \
-      .order_by(func.count(Transactions.TranscID).desc()) \
-      .limit(6) \
-      .all()
+    hot_events_info = list(db.events.aggregate([
+        {
+            '$lookup': {
+                'from': 'transactions',
+                'localField': '_id',
+                'foreignField': 'event_id',
+                'as': 'transactions'
+            }
+        },
+        {
+            '$addFields': {
+                'transaction_count': {'$size': '$transactions'}
+            }
+        },
+        {
+            '$sort': {'transaction_count': -1}
+        },
+        {'$limit': 6}
+    ]))
 
-      # Check if enough events were fetched
+    # Check if enough events were fetched
     if len(hot_events_info) < 6:
-        # Fetch more events to make the total count 6
         additional_events_needed = 6 - len(hot_events_info)
-        more_events = Event.query \
-            .filter(Event.EventID.notin_([event.EventID for event in hot_events_info])) \
-            .limit(additional_events_needed) \
-            .all()
-        hot_events_info.extend([(event.EventID, event.EventName, 0) for event in more_events])
+        more_events = list(db.events.find().limit(additional_events_needed))
+        hot_events_info.extend(more_events)
 
     # Prepare data to render
     hot_events = []
-    for event_info in hot_events_info:
-        event_id, event_name, _ = event_info
-        event = Event.query.options(joinedload(Event.image)).filter_by(EventID=event_id).first()
-        if event.image:
-            event.preferred_image = min(event.image, key=lambda img: abs(img.Width - preferred_width))
-            image_url = event.preferred_image.URL
-        else:
-            image_url = url_for('static', filename='images/default.jpg')
-
+    for event in hot_events_info:
+        image_url = event.get('image_url', url_for('static', filename='images/default.jpg'))
         hot_events.append({
-            'EventID': event_id,
-            'EventName': event_name,
+            'EventID': str(event['_id']),
+            'EventName': event['name'],
             'ImageURL': image_url
         })
 
     # Fetch the most popular venues based on the number of associated events
-    top_venues_query = db.session.query(
-        Location.LocationID,
-        Location.VenueName,
-        db.func.count(Event.EventID).label('event_count'),
-    ).join(Location.event) \
-     .outerjoin(Location.image) \
-     .group_by(Location.LocationID) \
-     .order_by(db.func.count(Event.EventID).desc()) \
-     .limit(6)
+    top_venues = list(db.locations.aggregate([
+        {
+            '$lookup': {
+                'from': 'events',
+                'localField': '_id',
+                'foreignField': 'location_id',
+                'as': 'events'
+            }
+        },
+        {
+            '$addFields': {
+                'event_count': {'$size': '$events'}
+            }
+        },
+        {'$sort': {'event_count': -1}},
+        {'$limit': 6}
+    ]))
 
-    top_venues = top_venues_query.all()
-
-    # Ensure there are 6 venues
-    if len(top_venues) < 6:
-        additional_venues_needed = 6 - len(top_venues)
-        additional_venues = Location.query \
-            .filter(Location.LocationID.notin_([venue.LocationID for venue in top_venues])) \
-            .limit(additional_venues_needed) \
-            .all()
-        top_venues.extend([(venue.LocationID, venue.VenueName, 0, None) for venue in additional_venues])
-
-    # Format the fetched venues
     formatted_venues = []
     for venue in top_venues:
-        location_id, venue_name, event_count = venue
-        location = Location.query.options(joinedload(Location.image)).filter_by(LocationID=location_id).first()
-        if location.image:
-            # Choosing the best image based on width preference
-            preferred_image = min(location.image, key=lambda img: abs(img.Width - preferred_width))
-            image_url = preferred_image.URL
-        else:
-            image_url = url_for('static', filename='images/default.jpg')
-        
+        image_url = venue.get('image_url', url_for('static', filename='images/default.jpg'))
         formatted_venues.append({
-            'LocationID': location_id,
-            'VenueName': venue_name,
+            'LocationID': str(venue['_id']),
+            'VenueName': venue['name'],
             'ImageURL': image_url
         })
 
     return render_template('landing.html', hot_events=hot_events, venues=formatted_venues)
 
+
 @app.route('/event')
 def event():
-    search_query = request.args.get('search', '').lower() 
-    search_month = request.args.get('search_month')  
-    page = request.args.get('page', 1, type=int)  
-    events_per_page = 9  
-    events_by_month_year = {}
-    preferred_width = 1920
-    search_date_parsed = None
+    search_query = request.args.get('search', '').lower()
+    search_month = request.args.get('search_month')
+    page = request.args.get('page', 1, type=int)
+    events_per_page = 9
 
+    filters = {}
+    if search_query:
+        filters['name'] = {'$regex': search_query, '$options': 'i'}
     if search_month:
         try:
-            search_date_parsed = datetime.strptime(search_month, '%Y-%m')
+            search_date = datetime.strptime(search_month, '%Y-%m')
+            filters['date'] = {'$gte': search_date, '$lt': search_date.replace(month=search_date.month + 1)}
         except ValueError:
-            search_date_parsed = None  
+            pass
 
-    base_query = Event.query.options(joinedload(Event.image)).order_by(Event.EventDate)
+    events = db.events.find(filters).skip((page - 1) * events_per_page).limit(events_per_page)
 
-    if search_query and search_date_parsed:
-        base_query = base_query.filter(
-            and_(
-                Event.EventName.ilike(f'%{search_query}%'),
-                Event.EventDate.between(search_date_parsed.replace(day=1),
-                                        search_date_parsed.replace(day=calendar.monthrange(search_date_parsed.year, search_date_parsed.month)[1]))
-            )
-        )
-    elif search_query:
-        base_query = base_query.filter(Event.EventName.ilike(f'%{search_query}%'))
-    elif search_date_parsed:
-        base_query = base_query.filter(
-            Event.EventDate.between(search_date_parsed.replace(day=1),
-                                    search_date_parsed.replace(day=calendar.monthrange(search_date_parsed.year, search_date_parsed.month)[1]))
-        )
-
-    # Pagination
-    paginated_events = base_query.paginate(page=page, per_page=events_per_page)
-
-    for event in paginated_events.items:
-        if event.image:
-            event.preferred_image = min(event.image, key=lambda img: abs(img.Width - preferred_width))
-        else:
-            event.preferred_image = None
-
-        # Group events by month and year
-        month_year = f"{calendar.month_name[event.EventDate.month]} {event.EventDate.year}"
-        if month_year not in events_by_month_year:
-            events_by_month_year[month_year] = []
-        events_by_month_year[month_year].append(event)
-
-    sorted_month_years = sorted(
-        events_by_month_year.keys(),
-        key=lambda x: (int(x.split(' ')[1]), -1 if int(x.split(' ')[1]) == datetime.now().year else 0)
-    )
-
-    return render_template(
-        'event.html',
-        events_by_month_year={key: events_by_month_year[key] for key in sorted_month_years},
-        search_query=search_query,
-        search_month=search_month, 
-        current_page=page,
-        total_pages=paginated_events.pages
-    )
+    return render_template('event.html', events=list(events), search_query=search_query, search_month=search_month)
 
 @app.route('/venue')
 def venue():
